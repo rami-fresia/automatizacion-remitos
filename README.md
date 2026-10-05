@@ -1,127 +1,85 @@
-# Pipeline de Generación Automática de Remitos
+# Generación automática de remitos en Zoho Books
 
-Automatización en producción para Berta, agencia de marketing de Leones, Córdoba.
-Reemplaza la creación manual mensual de remitos en Zoho Books con un pipeline
-que corre solo el día 1 de cada mes.
+Automatización en producción desde marzo de 2026 para Berta, agencia de marketing de Leones, Córdoba.
+Cada mes genera y envía los remitos de todos los clientes activos en Zoho Books a partir de una planilla de Google Sheets, sin que nadie toque nada.
 
-## Problema
+| Métrica | Valor |
+|---------|-------|
+| Remitos por mes | ~29 |
+| Remitos generados desde que está en producción | más de 200 |
+| Tiempo por corrida | ~8 minutos (incluye espera entre clientes) |
+| Trabajo manual que reemplaza | ~2,5 h por mes de carga en Zoho |
+| Remitos duplicados | 0 |
 
-Berta presta servicios mensuales a +25 clientes con contratos de monto y fecha
-de vencimiento fijos. El proceso era 100% manual: la administrativa entraba a
-Zoho Books, seleccionaba cada cliente, cargaba monto, descripción, fecha de
-vencimiento y publicaba — repitiendo esto para cada cliente todos los meses.
-Consumía tiempo operativo recurrente, era propenso a errores y dependía de que
-la persona lo hiciera en el momento correcto.
+## El problema
 
-## Solución
+Berta factura un abono mensual fijo a cada cliente. Todos los meses la administrativa tenía que entrar a Zoho Books, elegir el cliente, cargar monto, descripción y fechas de vencimiento, guardar y marcar como enviado. Una vez por cliente, unas 29 veces por mes.
 
-Workflow en n8n que corre automáticamente el **día 1 de cada mes a las 08:00 hs**
-(`cron: 0 8 1 * *`). Lee la tabla de contratos activos en Google Sheets, calcula
-las fechas de vencimiento, crea cada remito en Zoho Books vía API REST y lo
-publica en estado `Enviado` — sin intervención humana.
+Era un trabajo repetitivo, con riesgo de errores de tipeo, de olvidarse un cliente o de facturar dos veces el mismo período.
 
-## Arquitectura
+## La solución
 
-Cron: día 1 · 08:00 hs
-↓
-Google Sheets "Clientes"
-(contact_id, monto, fecha_vencimiento, activo, periodo_facturado)
-↓
-Filtrar activos + Anti-duplicado
-(compara periodo_facturado vs mes actual "Mayo de 2026")
-↓
-Calcular fecha de vencimiento
-(día fijo del mes o fecha exacta)
-↓
-Loop por cliente (con wait 10s entre requests)
-↓
-POST /estimates → Zoho Books API
-↓
-Validar respuesta (estimate_id)
-↓
-┌──────────────────┐
-ÉXITO              ERROR
-│                  │
-POST /status/sent    Log → Sheets "Errores_API"
-│
-Log → Sheets "Log_Creacion"
-│
-Update → Sheets "Clientes" (periodo_facturado)
+Un workflow de n8n que corre solo el **día 25 de cada mes a las 08:00**:
 
+```mermaid
+flowchart LR
+    A["Cron<br/>día 25, 08:00"] --> B["Google Sheets<br/>hoja Clientes"]
+    B --> C["Filtrar activos,<br/>validar datos<br/>y calcular fechas"]
+    C -->|datos incompletos| E1["Hoja Errores"]
+    C -->|ok| D["Loop por cliente<br/>(espera 10 s)"]
+    D --> F["Zoho Books API<br/>POST /estimates"]
+    F --> G{"¿Creado?"}
+    G -->|sí| H["Marcar como enviado"]
+    H --> I["Log_Creacion"]
+    I --> J["Escribir periodo_facturado<br/>(candado anti-duplicado)"]
+    G -->|no| E2["Hoja Errores_API"]
+```
 
+![Workflow en n8n](Worflow%20creacion%20de%20remitos.png)
 
-## Stack técnico
+*La captura muestra el nombre original del disparador ("Día 1"); hoy corre el día 25 (ver más abajo).*
 
-- **n8n** (self-hosted) — orquestador del workflow
-- **Zoho Books API** — creación de estimates via REST (`POST /estimates`)
-- **Google Sheets** — fuente de contratos + log de resultados
-- **Docker + EasyPanel + VPS Contabo** — infraestructura self-hosted
+## Decisiones técnicas
 
-## Detalles técnicos
+**Candado anti-duplicado.** Al terminar cada cliente, el workflow escribe el período facturado (por ejemplo `Septiembre de 2026`) en la planilla. Antes de crear un remito compara contra ese campo y, si ya está, lo saltea. Se puede volver a ejecutar el workflow sin riesgo de facturar dos veces.
 
-**Anti-duplicado**: antes de crear un remito, el workflow verifica si el campo
-`periodo_facturado` del cliente ya contiene el período actual (ej: `"Mayo de 2026"`).
-Si coincide, lo saltea. Esto permite reejecutar el workflow sin riesgo de
-facturación doble.
+**Cobro a mes vencido.** El remito factura el mes trabajado, no el que empieza. El cálculo se hace con Luxon: `mesFacturar = today.minus({ months: 1 })`.
 
-**Cálculo de fechas de vencimiento**: soporta tres formatos en la columna
-`fecha_vencimiento` de Sheets:
-- Número de día (`10` → calcula el próximo día 10 del mes)
-- Fecha fija (`15/05/2026`)
-- Vacío → usa fecha del día de ejecución
+**Generación adelantada al día 25.** Originalmente corría el día 1. Se adelantó para que el sistema de cobranza ([automatizacion-cobranzas-whatsapp](https://github.com/rami-fresia/automatizacion-cobranzas-whatsapp)) pudiera mandar un primer aviso 12 días antes del vencimiento: con vencimientos el día 10, ese aviso cae antes de fin de mes, cuando el remito todavía no existía. Para no romper la lógica, el código toma como referencia el día 1 del mes siguiente (`now.plus({ months: 1 }).startOf('month')`), así fechas, descripción y vencimientos quedan iguales que antes. La transición se verificó contra Zoho: cero períodos salteados y cero duplicados.
 
-**Cobro a mes vencido**: el período facturado corresponde al mes anterior
-al de ejecución (`mesFacturar = today.minus({ months: 1 })`).
+**Manejo de errores sin cortar la corrida.** Los nodos de Zoho tienen reintentos y `continueRegularOutput`: si falla un cliente, se registra y sigue con el siguiente. Los errores se separan en dos hojas según el origen (datos incompletos en la planilla o rechazo de la API). Además, el workflow tiene asignado un Error Workflow que avisa por mail si algo se rompe fuera de lo previsto.
 
-**Rate limiting**: 10 segundos de espera entre clientes para respetar los
-límites de la API de Zoho.
+**Rate limiting.** 10 segundos entre clientes para no chocar con los límites de la API de Zoho.
 
-**Manejo de errores**: continúa al siguiente cliente ante fallos de API.
-Los errores se clasifican en dos hojas separadas según su origen.
+**Fechas de vencimiento flexibles.** La columna `fecha_vencimiento` acepta un día del mes (`10`), una fecha fija (`15/05/2026`) o vacío (usa la fecha de ejecución).
 
-## Estructura de Google Sheets
+## Planilla de origen
 
-### Hoja "Clientes" (fuente de contratos)
-| Campo | Tipo | Descripción |
-|-------|------|-------------|
-| `contact_id` | text | ID del cliente en Zoho Books |
-| `cliente_nombre` | text | Nombre del cliente |
-| `monto` | number | Monto mensual del contrato |
-| `fecha_vencimiento` | text | Día del mes o fecha fija |
-| `activo` | boolean | `TRUE` para incluir en el ciclo |
-| `Whatsapp` | text | Número en formato `549XXXXXXXXXX` |
-| `periodo_facturado` | text | Último período procesado (ej: `Mayo de 2026`) |
+Hoja **Clientes**:
 
-### Hojas de log
-- **Log_Creacion**: timestamp, cliente, número de remito, monto, fecha_vencimiento
-- **Errores**: errores de validación de datos por cliente
-- **Errores_API**: errores de respuesta de Zoho Books
+| Campo | Descripción |
+|-------|-------------|
+| `contact_id` | ID del cliente en Zoho Books |
+| `cliente_nombre` | Nombre del cliente |
+| `monto` | Abono mensual |
+| `fecha_vencimiento` | Día del mes o fecha fija |
+| `activo` | `TRUE` para incluirlo en el ciclo |
+| `periodo_facturado` | Último período facturado (candado) |
 
-## Estructura del proyecto
+Hojas de log: **Log_Creacion** (cada remito creado), **Errores** (datos inválidos) y **Errores_API** (respuestas fallidas de Zoho).
 
-/
-├── workflow-remitos.json   # Flujo exportado de n8n
-└── README.md
+## Stack
 
+- **n8n** self-hosted (Docker + EasyPanel en un VPS) como orquestador
+- **Zoho Books API v3** con OAuth 2.0
+- **Google Sheets** como fuente de datos y log
+- **JavaScript** (nodos Code con Luxon) para filtros y cálculo de fechas
 
+## Próximas mejoras
 
-## Resultados en producción
+- Idempotencia del lado de Zoho: consultar si ya existe un remito del período antes de crearlo, para cubrir el caso de que se cree el remito pero falle la escritura del candado.
+- Comparar el período por mes y año normalizados en lugar de texto exacto.
 
-- **25+ remitos generados** por ciclo en ~5 minutos
-- Última ejecución: 4 de mayo 2026 · 11:14 hs
-- Remitos del ciclo: REM-000098 al REM-000119+
-- **0 errores** en producción (hojas Errores y Errores_API vacías)
-- 0 intervención manual requerida desde implementación
+## Seguridad
 
-## Variables de entorno necesarias
-
-ZOHO_CLIENT_ID=
-ZOHO_CLIENT_SECRET=
-ZOHO_ORGANIZATION_ID=
-GOOGLE_SHEETS_SPREADSHEET_ID=
-GOOGLE_SERVICE_ACCOUNT_EMAIL=
-GOOGLE_SERVICE_ACCOUNT_KEY=
-
-
-
-> Las credenciales reales no están incluidas en este repositorio.
+Este repositorio no contiene credenciales, IDs de organización, IDs de planillas ni datos de clientes. Las credenciales viven cifradas en el gestor de credenciales de n8n.

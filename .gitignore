@@ -1,0 +1,15 @@
+# Credenciales y archivos sensibles: nunca al repo
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*credentials*.json
+*service-account*.json
+
+# Exports de n8n sin sanitizar
+*.n8n-raw.json
+
+# Sistema
+.DS_Store
+Thumbs.db
